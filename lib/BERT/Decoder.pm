@@ -15,24 +15,25 @@ sub new {
 
 sub decode {
     my ($self, $bert) = @_;
+    my $bert_ref = \$bert;
 
-    (my $magic, $bert) = unpack('Ca*', $bert);
+    my $magic = unpack('C', substr $bert, 0, 1);
 
     croak sprintf('Bad magic number. Expected %d found %d', MAGIC_NUMBER, $magic)
         unless MAGIC_NUMBER == $magic;
 
-    return $self->extract_any($bert);
+    return $self->_extract_any($bert_ref, 1);
 }
 
-sub extract_any {
-    my ($self, $bert) = @_;
+sub _extract_any {
+    my ($self, $bert_ref, $offset) = @_;
 
-    (my $value, $bert) = $self->read_any($bert);
+    (my $value, $offset) = $self->read_any($bert_ref, $offset);
 
     $value = $self->extract_complex_type($value)
         if ref $value eq 'BERT::Tuple';
 
-    return [ $value, $self->extract_any($bert) ] if $bert;
+    return [ $value, $self->_extract_any($bert_ref, $offset + 1) ] if $offset < length($$bert_ref);
     return $value;
 }
 
@@ -72,124 +73,79 @@ sub extract_complex_type {
 }
 
 sub read_any {
-    my ($self, $bert) = @_;
+    my ($self, $bert_ref, $offset) = @_;
     my $value;
 
-    (my $type, $bert) = unpack('Ca*', $bert);
+    my $type = unpack('C', substr $$bert_ref, $offset, 1);
+    $offset++;
 
-    if    (SMALL_INTEGER_EXT == $type) { return $self->read_small_integer($bert) }
-    elsif (INTEGER_EXT == $type)       { return $self->read_integer($bert)       }
-    elsif (FLOAT_EXT == $type)         { return $self->read_float($bert)         }
-    elsif (ATOM_EXT == $type)          { return $self->read_atom($bert)          } 
-    elsif (SMALL_TUPLE_EXT == $type)   { return $self->read_small_tuple($bert)   }
-    elsif (LARGE_TUPLE_EXT == $type)   { return $self->read_large_tuple($bert)   }
-    elsif (NIL_EXT == $type)           { return $self->read_nil($bert)           }
-    elsif (STRING_EXT == $type)        { return $self->read_string($bert)        } 
-    elsif (LIST_EXT == $type)          { return $self->read_list($bert)          } 
-    elsif (BINARY_EXT == $type)        { return $self->read_binary($bert)        } 
-    elsif (SMALL_BIG_EXT == $type)     { return $self->read_small_big($bert)     }
-    elsif (LARGE_BIG_EXT == $type)     { return $self->read_large_big($bert)     }
-    else                               { croak "Unknown type $type"              }
+    if (SMALL_INTEGER_EXT == $type) {
+        return (unpack('C', substr $$bert_ref, $offset, 1), $offset + 1);
+    } elsif (INTEGER_EXT == $type) {
+        # This should have been unpack('l>a*',...) only and not have extra unpack('l',...)
+        # but I don't want to require perl >= v5.10
+        my $value = unpack('N', substr $$bert_ref, $offset, 4);
+        $value = unpack('l', pack('L', $value));
+        return ($value, $offset + 4);
+    }
+    elsif (FLOAT_EXT == $type) {
+        return (unpack('Z31', substr $$bert_ref, $offset, 31), $offset + 31);
+    }
+    elsif (ATOM_EXT == $type) {
+        my $len = unpack('n', substr $$bert_ref, $offset, 2);
+        $value = BERT::Atom->new(substr $$bert_ref, $offset + 2, $len);
+        return ($value, $offset + 2 + $len);
+    }
+    elsif (SMALL_TUPLE_EXT == $type) {
+        my $len = unpack('C', substr $$bert_ref, $offset, 1);
+        (my $array, $offset) = $self->_read_array($bert_ref, $offset + 1, $len);
+        return (BERT::Tuple->new($array), $offset);
+    }
+    elsif (LARGE_TUPLE_EXT == $type) {
+        my $len = unpack('N', substr $$bert_ref, $offset, 4);
+        (my $array, $offset) = $self->_read_array($bert_ref, $offset + 4, $len);
+        return (BERT::Tuple->new($array), $offset);
+    }
+    elsif (NIL_EXT == $type) {
+        return ([], $offset);
+    }
+    elsif (STRING_EXT == $type) {
+        my $len = unpack('n', substr $$bert_ref, $offset, 2);
+        return (
+            [unpack 'C*', substr $$bert_ref, $offset + 2, $len],
+            $offset + 2 + $len
+        );
+    }
+    elsif (LIST_EXT == $type) {
+        my $len = unpack('N', substr $$bert_ref, $offset, 4);
+        (my $value, $offset) = $self->_read_array($bert_ref, $offset + 4, $len);
+        my $type = unpack('C', substr $$bert_ref, $offset, 1);
+        croak 'Lists with non NIL tails are not supported'
+            unless NIL_EXT == $type;
+        return ($value, $offset + 1);
+    }
+    elsif (BINARY_EXT == $type) {
+        my $len = unpack('N', substr $$bert_ref, $offset, 4);
+        return (substr($$bert_ref, $offset + 4, $len), $offset + 4 + $len);
+    }
+    elsif (SMALL_BIG_EXT == $type) {
+        my $len = unpack('C', substr $$bert_ref, $offset, 1);
+        return $self->_read_bigint($bert_ref, $offset + 1, $len);
+    }
+    elsif (LARGE_BIG_EXT == $type) {
+        my $len = unpack('N', substr $$bert_ref, $offset, 4);
+        return $self->_read_bigint($bert_ref, $offset + 4, $len);
+    }
+    else {
+        croak "Unknown type $type";
+    }
 }
 
-sub read_small_integer {
-    my ($self, $bert) = @_;
-    (my $value, $bert) = unpack('Ca*', $bert);
-    return ($value, $bert);
-}
-
-sub read_integer {
-    my ($self, $bert) = @_;
-
-    # This should have been unpack('l>a*',...) only and not have extra unpack('l',...)
-    # but I don't want to require perl >= v5.10
-    (my $value, $bert) = unpack('Na*', $bert);
-    $value = unpack('l', pack('L', $value));
-    return ($value, $bert);
-}
-
-sub read_float {
-    my ($self, $bert) = @_;
-    (my $value, $bert) = unpack('Z31a*', $bert);
-    return ($value, $bert);
-}
-
-sub read_atom {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('na*', $bert);
-    (my $value, $bert) = unpack("a$len a*", $bert);
-    $value = BERT::Atom->new($value);
-    return ($value, $bert);
-}
-
-sub read_small_tuple {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Ca*', $bert);
-    (my $value, $bert) = $self->read_array($bert, $len, []);
-    $value = BERT::Tuple->new($value);
-    return ($value, $bert);
-}
-
-sub read_large_tuple {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Na*', $bert);
-    (my $value, $bert) = $self->read_array($bert, $len, []);
-    $value = BERT::Tuple->new($value);
-    return ($value, $bert);
-}
-
-sub read_nil {
-    my ($self, $bert) = @_;
-    my $value = [];
-    return ($value, $bert);
-}
-
-sub read_string {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('na*', $bert);
-    my @values = unpack("C$len a*", $bert);
-    $bert = pop @values;
-    my $value = \@values;
-    return ($value, $bert);
-}
-
-sub read_list {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Na*', $bert);
-    (my $value, $bert) = $self->read_array($bert, $len, []);
-    (my $type, $bert) = unpack('Ca*', $bert);
-    croak 'Lists with non NIL tails are not supported' 
-        unless NIL_EXT == $type;
-    return ($value, $bert);
-}
-
-sub read_binary {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Na*', $bert);
-    (my $value, $bert) = unpack("a$len a*", $bert);
-    return ($value, $bert);
-}
-
-sub read_small_big {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Ca*', $bert);
-    (my $value, $bert) = $self->read_bigint($bert, $len);
-    return ($value, $bert);
-}
-
-sub read_large_big {
-    my ($self, $bert) = @_;
-    (my $len, $bert) = unpack('Na*', $bert);
-    (my $value, $bert) = $self->read_bigint($bert, $len);
-    return ($value, $bert);
-}
-
-sub read_bigint {
+sub _read_bigint {
     my $self = shift;
-    my ($bert, $len) = @_;
+    my ($bert_ref, $offset, $len) = @_;
 
-    my($sign, @values)  = unpack("CC$len a*", $bert);
-    $bert = pop @values;
+    my($sign, @values)  = unpack('CC*', substr $$bert_ref, $offset, $len + 1);
 
     require Math::BigInt;
     my $i = Math::BigInt->new(0);
@@ -201,19 +157,18 @@ sub read_bigint {
 
     $value->bneg() if $sign != 0;
 
-    return ($value, $bert);
+    return ($value, $offset + 1 + $len);
 }
 
-sub read_array {
+sub _read_array {
     my $self = shift;
-    my ($bert, $len, $array) = @_;
-
-    if ($len > 0) {
-        (my $value, $bert) = $self->read_any($bert); 
-        return $self->read_array($bert, $len - 1, [@{ $array }, $value]);
-    } else {
-        return ($array, $bert);
+    my ($bert_ref, $offset, $len) = @_;
+    my @array;
+    for my $i (1 .. $len) {
+        (my $item, $offset) = $self->read_any($bert_ref, $offset);
+        push @array, $item;
     }
+    return (\@array, $offset);
 }
 
 1;
